@@ -180,42 +180,29 @@ type productCatalog struct {
 
 func readProductFiles() ([]*pb.Product, error) {
 
-	// find all .json files in the products directory
 	entries, err := os.ReadDir("./products")
 	if err != nil {
 		return nil, err
 	}
 
-	jsonFiles := make([]fs.FileInfo, 0, len(entries))
+	var products []*pb.Product
 	for _, entry := range entries {
 		if strings.HasSuffix(entry.Name(), ".json") {
-			info, err := entry.Info()
+			jsonData, err := os.ReadFile("./products/" + entry.Name())
 			if err != nil {
 				return nil, err
 			}
-			jsonFiles = append(jsonFiles, info)
-		}
-	}
 
-	// read the contents of each .json file and unmarshal into a ListProductsResponse
-	// then append the products to the catalog
-	var products []*pb.Product
-	for _, f := range jsonFiles {
-		jsonData, err := os.ReadFile("./products/" + f.Name())
-		if err != nil {
-			return nil, err
-		}
+			var res pb.ListProductsResponse
+			if err := protojson.Unmarshal(jsonData, &res); err != nil {
+				return nil, err
+			}
 
-		var res pb.ListProductsResponse
-		if err := protojson.Unmarshal(jsonData, &res); err != nil {
-			return nil, err
+			products = append(products, res.Products...)
 		}
-
-		products = append(products, res.Products...)
 	}
 
 	log.Infof("Loaded %d products", len(products))
-
 	return products, nil
 }
 
@@ -227,30 +214,10 @@ func mustMapEnv(target *string, key string) {
 	*target = value
 }
 
-func (p *productCatalog) Check(ctx context.Context, req *healthpb.HealthCheckRequest) (*healthpb.HealthCheckResponse, error) {
-	return &healthpb.HealthCheckResponse{Status: healthpb.HealthCheckResponse_SERVING}, nil
-}
-
-func (p *productCatalog) Watch(req *healthpb.HealthCheckRequest, ws healthpb.Health_WatchServer) error {
-	return status.Errorf(codes.Unimplemented, "health check via Watch not implemented")
-}
-
-func (p *productCatalog) ListProducts(ctx context.Context, req *pb.Empty) (*pb.ListProductsResponse, error) {
-	span := trace.SpanFromContext(ctx)
-
-	span.SetAttributes(
-		attribute.Int("app.products.count", len(catalog)),
-	)
-	return &pb.ListProductsResponse{Products: catalog}, nil
-}
-
 func (p *productCatalog) GetProduct(ctx context.Context, req *pb.GetProductRequest) (*pb.Product, error) {
     span := trace.SpanFromContext(ctx)
-    span.SetAttributes(
-        attribute.String("app.product.id", req.Id),
-    )
+    span.SetAttributes(attribute.String("app.product.id", req.Id))
 
-    // GetProduct will fail on a specific product when feature flag is enabled
     if p.checkProductFailure(ctx, req.Id) {
         msg := "Error: Product Catalog Fail Feature Flag Enabled"
         span.SetStatus(otelcodes.Error, msg)
@@ -258,54 +225,15 @@ func (p *productCatalog) GetProduct(ctx context.Context, req *pb.GetProductReque
         return nil, status.Errorf(codes.Internal, msg)
     }
 
-    var found *pb.Product
     for _, product := range catalog {
         if req.Id == product.Id {
-            found = product
-            break
+            span.SetAttributes(attribute.String("app.product.name", product.Name))
+            return product, nil
         }
     }
 
-    if found == nil {
-        msg := fmt.Sprintf("Product Not Found: %s", req.Id)
-        span.SetStatus(otelcodes.Error, msg)
-        span.AddEvent(msg)
-        return nil, status.Errorf(codes.NotFound, msg)
-    }
-
-    msg := fmt.Sprintf("Product Found - ID: %s, Name: %s", req.Id, found.Name)
+    msg := fmt.Sprintf("Product Not Found: %s", req.Id)
+    span.SetStatus(otelcodes.Error, msg)
     span.AddEvent(msg)
-    span.SetAttributes(
-        attribute.String("app.product.name", found.Name),
-    )
-    return found, nil
+    return nil, status.Errorf(codes.NotFound, msg)
 }
-
-func (p *productCatalog) SearchProducts(ctx context.Context, req *pb.SearchProductsRequest) (*pb.SearchProductsResponse, error) {
-	span := trace.SpanFromContext(ctx)
-
-	var result []*pb.Product
-	for _, product := range catalog {
-		if strings.Contains(strings.ToLower(product.Name), strings.ToLower(req.Query)) ||
-			strings.Contains(strings.ToLower(product.Description), strings.ToLower(req.Query)) {
-			result = append(result, product)
-		}
-	}
-	span.SetAttributes(
-		attribute.Int("app.products_search.count", len(result)),
-	)
-	return &pb.SearchProductsResponse{Results: result}, nil
-}
-
-func (p *productCatalog) checkProductFailure(ctx context.Context, id string) bool {
-	if id != "OLJCESPC7Z" {
-		return false
-	}
-
-	client := openfeature.NewClient("productCatalog")
-	failureEnabled, _ := client.BooleanValue(
-		ctx, "productCatalogFailure", false, openfeature.EvaluationContext{},
-	)
-	return failureEnabled
-}
-
